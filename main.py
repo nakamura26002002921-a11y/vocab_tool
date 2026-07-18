@@ -1,273 +1,136 @@
+"""
+main.py
+-------
+ロシア語単語帳自動生成システムの統合実行スクリプト。
+
+パイプライン: scraping.py -> summarize.py -> formatter.py
+
+- config.json からモデル名・トークン数・温度・並列数などの設定を読み込む。
+- concurrent.futures.ThreadPoolExecutor で単語ごとに並列処理する。
+- 失敗した単語はログ（logs/errors.log と DBのrun_errorsテーブル）に記録し、
+  CSVには pipeline.on_error の設定に応じて ERROR 行として残す（デフォルト）か、
+  除外する。
+- SQLiteキャッシュ（dictionary.db）により、既に処理済みの単語はスクレイピング・
+  LLM呼び出しの両方をスキップできる。
+"""
+
+from __future__ import annotations
+
 import argparse
-import json
+import concurrent.futures
 import os
-import csv
-import time
 import sys
-import re
-import requests
+import time
+
+from common import ensure_db_initialized, load_config, record_error, setup_logger
+from formatter import make_error_row, write_csv
+from scraping import ScrapingError, scrape_word
+from summarize import SummarizeError, summarize_word
 
 
-REQUIRED_HEADERS = [
-    "【コアイメージ】",
-    "【イメージ・語源】",
-    "【よくあるセット",
-    "【例文】",
-    "【類語・言い換え】",
-    "【自分用メモ】",
-]
+def process_word(word: str, config: dict, logger) -> dict:
+    """1単語分のパイプライン（scraping -> summarize）を実行し、
+    formatter.py が期待するCSV行dictを返す。失敗時はERROR行を返す。"""
+    db_path = config["database"]["path"]
 
-JP_CHAR_RE = re.compile(r'[\u3040-\u30FF\u4E00-\u9FFF]')
-ASCII_LETTER_RE = re.compile(r'[A-Za-z]')
+    try:
+        scraped = scrape_word(word, config)
+    except ScrapingError as e:
+        logger.error("word=%s stage=scraping error=%s", word, e)
+        record_error(db_path, word, "scraping", str(e))
+        return make_error_row(word, f"scraping failed: {e}")
+    except Exception as e:  # noqa: BLE001
+        logger.error("word=%s stage=scraping unexpected_error=%s", word, e)
+        record_error(db_path, word, "scraping", f"unexpected: {e}")
+        return make_error_row(word, f"scraping unexpected error: {e}")
 
+    try:
+        summary = summarize_word(word, scraped, config)
+    except SummarizeError as e:
+        logger.error("word=%s stage=summarize error=%s", word, e)
+        record_error(db_path, word, "summarize", str(e))
+        return make_error_row(word, f"summarize failed: {e}")
+    except Exception as e:  # noqa: BLE001
+        logger.error("word=%s stage=summarize unexpected_error=%s", word, e)
+        record_error(db_path, word, "summarize", f"unexpected: {e}")
+        return make_error_row(word, f"summarize unexpected error: {e}")
 
-def load_config():
-    with open('config.json', 'r', encoding='utf-8') as f:
-        config = json.load(f)
-
-    raw_url = config['llm']['base_url']
-    if raw_url.startswith("${") and ":-" in raw_url:
-        inner = raw_url[2:-1]
-        var_name, default_url = inner.split(":-", 1)
-        base_url = os.environ.get(var_name, default_url)
-    else:
-        base_url = raw_url
-
-    config['llm']['base_url'] = base_url.rstrip('/')
-
-    config.setdefault('pipeline', {})
-    config['pipeline'].setdefault('num_candidates', 3)
-    config['pipeline'].setdefault('generate_temperature', 0.7)
-    config['pipeline'].setdefault('refine_temperature', 0.2)
-    return config
+    logger.info("word=%s completed", word)
+    return summary
 
 
-def strip_code_fences(text):
-    text = re.sub(r'^```(?:text|markdown)?\s*', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE)
-    return text.strip()
+def is_error_row(row: dict) -> bool:
+    return isinstance(row.get("POS"), str) and row["POS"].startswith("ERROR:")
 
 
-def call_llm(messages, temperature, config):
-    """Ollama(OpenAI互換API)への1回の呼び出し。成功時は文字列、失敗時はNoneを返す"""
-    url = f"{config['llm']['base_url']}/v1/chat/completions"
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "model": config['llm']['model'],
-        "messages": messages,
-        "temperature": temperature,
-        "stream": False
-    }
+def run_pipeline(words: list[str], config: dict, logger) -> tuple[list[dict], int]:
+    max_workers = config["pipeline"]["max_workers"]
+    on_error = config["pipeline"]["on_error"]  # "keep_as_error_row" | "exclude"
 
-    max_retries = max(1, config['llm']['max_retries'])
-    timeout = config['llm']['timeout_seconds']
+    results_by_word: dict[str, dict] = {}
+    error_count = 0
 
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            response.raise_for_status()
-            result = response.json()
-            choices = result.get('choices')
-            if not choices:
-                raise ValueError(f"応答に choices が含まれていません: {result}")
-            content = choices[0].get('message', {}).get('content', '').strip()
-            if not content:
-                raise ValueError("応答内容が空でした")
-            return content
-        except Exception as e:
-            print(f"    [!] エラー (試行 {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_word = {
+            executor.submit(process_word, word, config, logger): word for word in words
+        }
+        for future in concurrent.futures.as_completed(future_to_word):
+            word = future_to_word[future]
+            try:
+                row = future.result()
+            except Exception as e:  # noqa: BLE001
+                # process_word内部で捕捉しきれなかった予期しない例外への最終防御
+                logger.error("word=%s stage=pipeline fatal_error=%s", word, e)
+                record_error(config["database"]["path"], word, "pipeline", f"fatal: {e}")
+                row = make_error_row(word, f"fatal pipeline error: {e}")
 
-    return None
+            if is_error_row(row):
+                error_count += 1
 
+            results_by_word[word] = row
 
-# ---------------------------------------------------------------------------
-# 1. Generate（モンテカルロ）: 候補をnum_candidates個生成する
-# ---------------------------------------------------------------------------
-def generate_candidates(word, prompt_template, config):
-    prompt = prompt_template.replace("{word}", word)
-    n = config['pipeline']['num_candidates']
-    temperature = config['pipeline']['generate_temperature']
+    # 入力順を維持してCSVに書き出す
+    ordered_rows = [results_by_word[w] for w in words]
 
-    candidates = []
-    for i in range(n):
-        print(f"    Generate {i + 1}/{n} (temperature={temperature})...")
-        content = call_llm(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            config=config
-        )
-        if content:
-            candidates.append(strip_code_fences(content))
-        else:
-            print(f"    -> 候補{i + 1}の生成に失敗しました（スキップ）")
+    if on_error == "exclude":
+        ordered_rows = [r for r in ordered_rows if not is_error_row(r)]
 
-    return candidates
-
-
-# ---------------------------------------------------------------------------
-# 2. Select（Python）: フォーマットと言語純度でスコアリングし、最良の候補を選ぶ
-# ---------------------------------------------------------------------------
-def score_candidate(text):
-    score = 0
-    reasons = []
-
-    # --- フォーマットチェック ---
-    if text.count("====") >= 2:
-        score += 2
-    else:
-        reasons.append("区切り線(====)が不足")
-
-    for header in REQUIRED_HEADERS:
-        if header in text:
-            score += 1
-        else:
-            reasons.append(f"見出し欠落: {header}")
-
-    if "```" in text:
-        score -= 5
-        reasons.append("マークダウンのコードブロックが残存")
-
-    # 挨拶や余計な前置き（「承知しました」「以下に」等）が先頭にあると減点
-    first_line = text.strip().splitlines()[0] if text.strip() else ""
-    if not first_line.startswith("=") and not re.match(r'^[A-Za-z].*\s*/.*/', first_line):
-        # 先頭が単語行(====か発音記号行)でない場合は減点
-        if any(greeting in first_line for greeting in ["承知", "以下", "です", "ます"]):
-            score -= 2
-            reasons.append("先頭に余計な前置き文がある")
-
-    # --- 言語純度チェック ---
-    # 例文セクション: 英語部分にアルファベットが十分含まれているか
-    example_match = re.search(r'【例文】(.*?)【', text, re.DOTALL)
-    if example_match:
-        example_text = example_match.group(1)
-        ascii_ratio = len(ASCII_LETTER_RE.findall(example_text)) / max(len(example_text), 1)
-        if ascii_ratio > 0.15:
-            score += 2
-        else:
-            reasons.append("例文セクションに英語が少ない/欠落")
-    else:
-        reasons.append("例文セクションが見つからない")
-
-    # 自分用メモ・イメージ語源セクション: 日本語が十分含まれているか
-    for section_name in ["【イメージ・語源】", "【自分用メモ】"]:
-        pattern = re.escape(section_name) + r'(.*?)(【|====|$)'
-        m = re.search(pattern, text, re.DOTALL)
-        if m:
-            section_text = m.group(1)
-            jp_ratio = len(JP_CHAR_RE.findall(section_text)) / max(len(section_text), 1)
-            if jp_ratio > 0.2:
-                score += 2
-            else:
-                reasons.append(f"{section_name}の日本語比率が低い")
-
-    # 極端に短い/長いものは減点（フォーマット崩れの疑い）
-    length = len(text)
-    if length < 150:
-        score -= 3
-        reasons.append("全体が短すぎる")
-    elif length > 2000:
-        score -= 1
-        reasons.append("全体が長すぎる")
-
-    return score, reasons
-
-
-def select_best(candidates):
-    if not candidates:
-        return None, []
-
-    scored = []
-    for idx, c in enumerate(candidates):
-        s, reasons = score_candidate(c)
-        scored.append((s, idx, c, reasons))
-        print(f"    候補{idx + 1}: score={s}  ({'; '.join(reasons) if reasons else '問題なし'})")
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_idx, best_text, best_reasons = scored[0]
-    print(f"    -> 候補{best_idx + 1}を選択 (score={best_score})")
-    return best_text, scored
-
-
-# ---------------------------------------------------------------------------
-# 3. Refine（CoT）: 選ばれた候補をLLMに渡し、思考プロセスで修正させ最終版を得る
-# ---------------------------------------------------------------------------
-def refine_candidate(word, candidate_text, refine_prompt_template, config):
-    prompt = refine_prompt_template.replace("{candidate}", candidate_text)
-    temperature = config['pipeline']['refine_temperature']
-
-    print(f"    Refine中 (temperature={temperature})...")
-    content = call_llm(
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-        config=config
-    )
-
-    if not content:
-        print("    -> Refineに失敗。Selectで選ばれた候補をそのまま使用します。")
-        return candidate_text
-
-    content = strip_code_fences(content)
-
-    marker = "### FINAL ###"
-    if marker in content:
-        final_text = content.split(marker, 1)[1].strip()
-    else:
-        # マーカーが見つからない場合は、最後の==== ブロックを探す
-        blocks = re.findall(r'=+.*?=+', content, re.DOTALL)
-        if blocks:
-            final_text = blocks[-1].strip()
-        else:
-            print("    -> FINALマーカーが見つからず、Refine結果全体を採用します。")
-            final_text = content
-
-    final_text = strip_code_fences(final_text)
-    return final_text if final_text else candidate_text
-
-
-def process_word(word, prompt_template, refine_prompt_template, config):
-    # 1. Generate
-    candidates = generate_candidates(word, prompt_template, config)
-    if not candidates:
-        return "ERROR: 候補の生成にすべて失敗しました。"
-
-    # 2. Select
-    best_text, scored = select_best(candidates)
-    if best_text is None:
-        return "ERROR: 候補の選択に失敗しました。"
-
-    # 3. Refine
-    final_text = refine_candidate(word, best_text, refine_prompt_template, config)
-    return final_text
+    return ordered_rows, error_count
 
 
 def main():
-    parser = argparse.ArgumentParser(description="単語帳自動生成スクリプト (Generate-Select-Refine)")
-    parser.add_argument('--input', required=True, help='入力ファイル (例: words.txt)')
-    parser.add_argument('--output', required=True, help='出力ファイル (例: output.csv)')
-    parser.add_argument('--startidx', type=int, default=1, help='開始インデックス (1始まり)')
-    parser.add_argument('--endidx', type=int, default=None, help='終了インデックス (1始まり, 省略時は末尾まで)')
+    parser = argparse.ArgumentParser(
+        description="ロシア語単語帳自動生成システム (Scraping[XPath] -> Summarize[Saiga2 13B] -> CSV出力)"
+    )
+    parser.add_argument("--input", help="入力ファイル（1行1単語）。省略時は config.json の pipeline.input_file")
+    parser.add_argument("--output", help="出力CSVファイル。省略時は config.json の pipeline.output_file")
+    parser.add_argument("--config", default="config.json", help="設定ファイルパス")
+    parser.add_argument("--startidx", type=int, default=1, help="開始インデックス（1始まり）")
+    parser.add_argument("--endidx", type=int, default=None, help="終了インデックス（1始まり、省略時は末尾まで）")
     args = parser.parse_args()
 
-    if not os.path.exists(args.input):
-        print(f"[エラー] 入力ファイルが見つかりません: {args.input}")
+    config = load_config(args.config)
+    logger = setup_logger(config["pipeline"]["log_file"])
+
+    input_path = args.input or config["pipeline"]["input_file"]
+    output_path = args.output or config["pipeline"]["output_file"]
+
+    if not os.path.exists(input_path):
+        logger.error("入力ファイルが見つかりません: %s", input_path)
         sys.exit(1)
 
-    config = load_config()
-    print(f"LLM Model: {config['llm']['model']}")
-    print(f"Base URL: {config['llm']['base_url']}")
-    print(f"Pipeline: Generate({config['pipeline']['num_candidates']}candidates) -> Select -> Refine")
+    db_path = config["database"]["path"]
+    ensure_db_initialized(db_path)
 
-    with open(args.input, 'r', encoding='utf-8-sig') as f:
+    with open(input_path, "r", encoding="utf-8-sig") as f:
         words = [line.strip() for line in f if line.strip()]
 
     if not words:
-        print("[エラー] 入力ファイルに単語がありません。")
+        logger.error("入力ファイルに単語がありません: %s", input_path)
         sys.exit(1)
 
     if args.startidx < 1 or args.startidx > len(words):
-        print(f"[エラー] --startidx が範囲外です (1〜{len(words)})")
+        logger.error("--startidx が範囲外です (1〜%d)", len(words))
         sys.exit(1)
 
     start = args.startidx - 1
@@ -275,48 +138,25 @@ def main():
     end = min(end, len(words))
     target_words = words[start:end]
 
-    print(f"処理対象: {len(target_words)} 語 ({args.startidx} 番目 〜 {start + len(target_words)} 番目)")
+    logger.info(
+        "処理開始: 単語数=%d model=%s max_workers=%d",
+        len(target_words), config["llm"]["model"], config["pipeline"]["max_workers"],
+    )
 
-    for path, label in [('prompt.txt', 'Generate用プロンプト'), ('refine_prompt.txt', 'Refine用プロンプト')]:
-        if not os.path.exists(path):
-            print(f"[エラー] {path} ({label}) が見つかりません。")
-            sys.exit(1)
+    start_time = time.time()
+    rows, error_count = run_pipeline(target_words, config, logger)
+    elapsed = time.time() - start_time
 
-    with open('prompt.txt', 'r', encoding='utf-8') as f:
-        prompt_template = f.read()
-    with open('refine_prompt.txt', 'r', encoding='utf-8') as f:
-        refine_prompt_template = f.read()
+    write_csv(rows, output_path, use_bom=config["pipeline"]["csv_bom"])
 
-    output_dir = os.path.dirname(os.path.abspath(args.output))
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
+    logger.info(
+        "処理完了: 出力=%s 成功=%d 失敗=%d 所要時間=%.1f秒",
+        output_path, len(rows) - error_count, error_count, elapsed,
+    )
 
-    error_count = 0
-
-    with open(args.output, 'w', newline='', encoding='utf-8-sig') as f:
-        writer = csv.writer(f)
-        writer.writerow(['単語', '生成した単語帳'])
-        f.flush()
-
-        try:
-            for i, word in enumerate(target_words, start=args.startidx):
-                print(f"[{i}/{len(words)}] 処理中: {word}")
-                card_content = process_word(word, prompt_template, refine_prompt_template, config)
-                writer.writerow([word, card_content])
-                f.flush()
-
-                if card_content.startswith("ERROR:"):
-                    error_count += 1
-                    print("  -> 失敗")
-                else:
-                    print("  -> 完了")
-        except KeyboardInterrupt:
-            print("\n[中断] ユーザーにより処理が中断されました。ここまでの結果は保存されています。")
-            sys.exit(1)
-
-    print(f"\n✅ 処理が完了しました。出力先: {args.output}")
     if error_count:
-        print(f"⚠ {error_count} 件の単語で生成に失敗しました。CSV内の 'ERROR:' 行を確認してください。")
+        print(f"\n⚠ {error_count} 件の単語で処理に失敗しました。詳細は {config['pipeline']['log_file']} を確認してください。")
+    print(f"✅ 出力先: {output_path}")
 
 
 if __name__ == "__main__":

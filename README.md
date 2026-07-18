@@ -1,16 +1,30 @@
-# 単語帳自動生成スクリプト (Generate-Select-Refine版)
+# ロシア語単語帳自動生成システム (XPath scraping + Saiga2 13B + SQLite cache)
 
-Ollama（ローカルLLM）を使って英単語の単語帳（フラッシュカード）をCSVで自動生成します。
-1単語ごとに以下の3ステップを実行します。
+Web上のロシア語辞書サイトからXPathで情報を取得し、Ollama経由のSaiga2 13Bで
+構造化データ（CSV）に変換するシステムです。
 
-1. **Generate（モンテカルロ）**: `prompt.txt` を使い、temperatureを効かせて候補を`num_candidates`個（デフォルト3）生成し、多様性を確保する。
-2. **Select（Python）**: 生成された各候補を以下の観点でスコアリングし、最も点数の高い候補を1つ選ぶ。
-   - フォーマット: `====`区切り線・全見出し(【コアイメージ】等)の有無、マークダウンコードブロックの残存、冒頭の余計な前置き文
-   - 言語純度: 【例文】セクションにアルファベットが十分含まれているか、【イメージ・語源】【自分用メモ】セクションに日本語が十分含まれているか
-   - 長さ: 極端に短い/長い場合は減点（フォーマット崩れの疑い）
-3. **Refine（CoT）**: `refine_prompt.txt` を使い、選ばれた候補をLLMに渡す。LLMはまず【思考プロセス】として問題点を洗い出し、`### FINAL ###` という区切り行の後に完成版のみを出力する。スクリプトはこの区切り以降を抽出して最終出力とする。
+## パイプライン
 
-## 事前準備
+```
+words.txt
+   │
+   ▼
+[scraping.py]   requests + lxml(XPath) で辞書サイトから情報抽出
+                 → SQLite raw_data テーブルにキャッシュ (キー: word, source_url)
+   │
+   ▼
+[summarize.py]  Ollama (Saiga2 13B, temperature=0.0) でCSV1行に構造化
+                 → SQLite summaries テーブルにキャッシュ (キー: word, prompt_hash)
+   │
+   ▼
+[formatter.py]  vocab.csv として出力 (UTF-8 with BOM)
+   │
+   ▲
+[main.py]       ThreadPoolExecutor で単語ごとに並列実行、config.json 読込、
+                 エラーハンドリング (logs/errors.log + DB run_errors テーブル)
+```
+
+## セットアップ
 
 ```bash
 pip install -r requirements.txt
@@ -19,51 +33,98 @@ pip install -r requirements.txt
 Ollamaを起動し、モデルをダウンロードしておいてください。
 
 ```bash
-ollama pull qwen2.5:14b
+ollama pull hf.co/IlyaGusev/saiga2_13b_gguf:model-q4_K.gguf
 ```
+
+DBは初回実行時に `main.py` が自動的に `init_db.sql` を使って作成します
+（手動で作る場合は `sqlite3 dictionary.db < init_db.sql`）。
 
 ## 実行方法
 
 ```bash
-python3 main.py --input words.txt --output output.csv --startidx 1 --endidx 5
+python main.py --input words.txt --output vocab.csv
 ```
 
-- `--input`: 単語が1行ずつ書かれたテキストファイル
-- `--output`: 出力CSVファイル名（utf-8-sig、Excelでもそのまま開けます）
-- `--startidx`: 開始行（1始まり、省略時は1）
-- `--endidx`: 終了行（1始まり、省略時は末尾まで）
+`--startidx` / `--endidx` で処理範囲を指定できます（1始まり）。
 
-## config.json の pipeline 設定
+```bash
+python main.py --input words.txt --output vocab.csv --startidx 3 --endidx 10
+```
+
+## config.json の主な設定項目
+
+| キー | 説明 |
+|---|---|
+| `database.path` | SQLiteファイルパス（デフォルト: `dictionary.db`） |
+| `llm.model` | Ollamaモデル名（デフォルト: Saiga2 13B） |
+| `llm.temperature` | 生成温度（ハルシネーション防止のため `0.0` 推奨） |
+| `llm.max_tokens` | 最大トークン数（デフォルト `1024`） |
+| `scraping.sources` | XPath辞書ソースのリスト。複数サイトを自由に追加可能 |
+| `pipeline.max_workers` | 並列実行数 |
+| `pipeline.on_error` | `keep_as_error_row`（エラーもCSVに残す）または `exclude`（除外） |
+
+### XPathソースの追加方法
+
+`config.json` の `scraping.sources` に以下の形式でオブジェクトを追加します。
 
 ```json
-"pipeline": {
-  "num_candidates": 3,          // Generateで作る候補数
-  "generate_temperature": 0.7,  // Generate時のtemperature（多様性重視で高め）
-  "refine_temperature": 0.2     // Refine時のtemperature（安定重視で低め）
+{
+  "name": "my_source",
+  "url_template": "https://example.com/dict/{word}",
+  "enabled": true,
+  "xpath_map": {
+    "meaning_list": "//div[@class='meaning']//li"
+  },
+  "timeout_seconds": 15,
+  "max_retries": 2,
+  "request_delay_seconds": 1.0
 }
 ```
 
-候補数や各温度は自由に調整できます。候補数を増やすほど多様性が増しますが、その分LLM呼び出し回数（≒処理時間）も増えます。
+`xpath_map` の各キーは任意の名前で、対応するXPath式が抽出するノードの
+テキストがリストとして `summarize.py` に渡されます。
+
+## 出力CSVのカラム
+
+| カラム | 内容 | 言語 |
+|---|---|---|
+| Word | 見出し語 | ロシア語（キリル文字） |
+| POS | 品詞 | 英語（メタデータ） |
+| Gender | 性（名詞のみ） | 英語（メタデータ） |
+| Aspect | 体（動詞のみ） | 英語（メタデータ） |
+| PairedVerb | ペア動詞 | ロシア語 |
+| Meanings_RU | 意味 | ロシア語原文 |
+| Collocations_RU | コロケーション | ロシア語原文 |
+| Examples_RU | 例文 | ロシア語原文 |
+| Accent | アクセント情報 | ロシア語（記号付き） |
+
+日本語訳は含まれません（言語混在によるノイズ防止のため）。
+
+## キャッシュ戦略
+
+- **Scraping**: `(word, source_url)` キーでキャッシュ。`status='ok'` または
+  `'not_found'`（恒久的な404等）のみキャッシュし、一時的なネットワークエラー等
+  (`status='error'`) はキャッシュせず次回再試行します。
+- **Summarize**: `(word, prompt_hash)` キーでキャッシュ。`prompt_hash` は
+  プロンプトテンプレート＋スクレイピング結果＋モデル名から算出されるため、
+  プロンプトやスクレイピング結果が変わると自動的に再生成されます。
+
+## エラーハンドリング
+
+各単語の各ステップ（scraping / summarize）で例外を捕捉し、
+`logs/errors.log` と SQLite の `run_errors` テーブルの両方に記録します。
+`pipeline.on_error` が `keep_as_error_row`（デフォルト）の場合、
+失敗した単語は `POS` 列に `ERROR: ...` と記載された行としてCSVに残ります。
 
 ## ファイル構成
 
-- `main.py`: Generate → Select → Refine のパイプライン本体
-- `config.json`: LLM接続設定 + パイプライン設定
-- `prompt.txt`: Generateステップで使うプロンプト
-- `refine_prompt.txt`: Refineステップで使うプロンプト（CoT形式）
-- `words.txt`: サンプル単語リスト
-
-## 処理の流れ（1単語あたり）
-
-```
-[Generate] prompt.txt を temperature=0.7 で3回呼び出し → 候補A, B, C
-    ↓
-[Select]   各候補をスコアリング（フォーマット + 言語純度）→ 最高得点の候補を選択
-    ↓
-[Refine]   refine_prompt.txt に選ばれた候補を渡す
-           → LLMが思考プロセスで問題点を洗い出し、### FINAL ### 以降に完成版を出力
-           → 完成版のみを抽出してCSVに書き込み
-```
-
-途中でエラーが出た候補はSelectステップで自動的にスコアが下がるため選ばれにくくなります。
-全候補の生成に失敗した場合や選択・Refineに失敗した場合は `ERROR:` から始まる文字列がCSVに記録され、処理は次の単語に進みます（途中終了しません）。
+| ファイル | 役割 |
+|---|---|
+| `common.py` | 設定読込・DB接続・ロギングの共通ユーティリティ |
+| `scraping.py` | XPathスクレイピング + raw_dataキャッシュ |
+| `summarize.py` | Ollama(Saiga2 13B)呼び出し + summariesキャッシュ |
+| `formatter.py` | vocab.csv 出力 |
+| `main.py` | 統合・並列実行エントリポイント |
+| `init_db.sql` | SQLiteテーブル定義 |
+| `config.json` | 設定ファイル |
+| `words.txt` | 入力単語リストのサンプル |

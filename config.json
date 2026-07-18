@@ -1,13 +1,89 @@
 {
+  "database": {
+    "path": "dictionary.db"
+  },
+
   "llm": {
-    "model": "qwen2.5:14b",
+    "model": "hf.co/IlyaGusev/saiga2_13b_gguf:model-q4_K.gguf",
     "base_url": "${OLLAMA_BASE_URL:-http://localhost:11434}",
-    "timeout_seconds": 60,
+    "temperature": 0.0,
+    "max_tokens": 1024,
+    "timeout_seconds": 120,
     "max_retries": 2
   },
+
+  "scraping": {
+    "sources": [
+      {
+        "name": "ru_wiktionary",
+        "source_type": "mediawiki_wikitext",
+        "url_template": "https://ru.wiktionary.org/wiki/{word}",
+        "api_url_template": "https://ru.wiktionary.org/w/api.php",
+        "enabled": true,
+        "field_map": {
+          "pos_block": "pos_block",
+          "meaning_list": "meaning_definitions",
+          "example_list": "examples",
+          "accent_word": "accent_word",
+          "collocation_list": "list:Фразеологизмы",
+          "synonyms": "list:Синонимы",
+          "etymology": "etymology"
+        },
+        "timeout_seconds": 15,
+        "max_retries": 2,
+        "request_delay_seconds": 1.0
+      },
+      {
+        "name": "multitran",
+        "source_type": "html",
+        "url_template": "https://www.multitran.com/m.exe?s={word}&l1=2&l2=9",
+        "enabled": true,
+        "field_map": {
+          "translations": [
+            "<td[^>]*class=\"[^\"]*subj[^\"]*\"[^>]*>.*?</td>\\s*<td[^>]*>\\s*(?:<a[^>]*>)?([^<]+)(?:</a>)?",
+            "<a[^>]*href=\"[^\"]*m\\.exe\\?[^\"]*\"[^>]*>([^<]+)</a>"
+          ],
+          "subject_areas": [
+            "<td[^>]*class=\"[^\"]*subj[^\"]*\"[^>]*>\\s*(?:<[^>]*>)*\\s*([^<]+?)\\s*(?:<[^>]*>)*\\s*</td>"
+          ]
+        },
+        "timeout_seconds": 15,
+        "max_retries": 2,
+        "request_delay_seconds": 1.5,
+        "note": "実際のHTML構造は未確認のため推定パターン。動作結果を見て field_map の正規表現を調整すること。"
+      },
+      {
+        "name": "reverso_context",
+        "source_type": "html",
+        "url_template": "https://context.reverso.net/translation/russian-english/{word}",
+        "enabled": true,
+        "field_map": {
+          "translations": [
+            "<a[^>]*class=\"[^\"]*translation[^\"]*\"[^>]*>\\s*<span[^>]*>([^<]+)</span>",
+            "<div[^>]*id=\"translations-content\"[^>]*>.*?<a[^>]*>([^<]+)</a>"
+          ],
+          "example_pairs_source": [
+            "<div[^>]*class=\"[^\"]*src[^\"]* ltr\"[^>]*>\\s*<span[^>]*class=\"text\"[^>]*>(.*?)</span>"
+          ],
+          "example_pairs_target": [
+            "<div[^>]*class=\"[^\"]*trg[^\"]* ltr\"[^>]*>\\s*<span[^>]*class=\"text\"[^>]*>(.*?)</span>"
+          ]
+        },
+        "timeout_seconds": 20,
+        "max_retries": 2,
+        "request_delay_seconds": 1.5,
+        "note": "SPA寄りのサイトのためSSR HTMLに翻訳データが含まれない場合がある。動作結果を見てfield_mapを調整、または __NEXT_DATA__ 等の埋め込みJSON抽出方式への切り替えが必要になる可能性あり。"
+      }
+    ],
+    "user_agent": "Mozilla/5.0 (compatible; VocabToolBot/1.0; +https://example.com/bot-info)"
+  },
+
   "pipeline": {
-    "num_candidates": 3,
-    "generate_temperature": 0.7,
-    "refine_temperature": 0.2
+    "max_workers": 4,
+    "on_error": "keep_as_error_row",
+    "input_file": "words.txt",
+    "output_file": "vocab.csv",
+    "csv_bom": true,
+    "log_file": "logs/errors.log"
   }
 }
