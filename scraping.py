@@ -562,12 +562,44 @@ def scrape_word(word: str, config: dict) -> dict:
     return {"word": word, "sources": results}
 
 
-if __name__ == "__main__":
-    # 単体テスト用の簡易実行
-    from common import ensure_db_initialized, load_config
+import argparse
+import json
+import sys
+# 必要な他のインポートはそのままにしてください
+from common import ensure_db_initialized, load_config
 
+def main():
+    parser = argparse.ArgumentParser(description="単語リストをスクレイピングするツール")
+    parser.add_argument("--startidx", type=int, default=1, help="開始行 (1始まり)")
+    parser.add_argument("--endidx", type=int, default=100, help="終了行")
+    parser.add_argument("--input", type=str, default="words.txt", help="入力ファイル名")
+    
+    args = parser.parse_args()
+
+    # 設定読み込み・DB初期化
     cfg = load_config()
     ensure_db_initialized(cfg["database"]["path"])
-    test_word = "спасибо"
-    data = scrape_word(test_word, cfg)
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+    # ファイルの読み込みと範囲の抽出
+    try:
+        with open(args.input, "r", encoding="utf-8") as f:
+            # 1始まりのインデックスをリストのインデックスに合わせるため調整
+            lines = [line.strip() for line in f.readlines()]
+            target_words = lines[args.startidx - 1 : args.endidx]
+    except FileNotFoundError:
+        print(f"エラー: {args.input} が見つかりません。")
+        sys.exit(1)
+
+    # 処理実行
+    results = []
+    for word in target_words:
+        if not word: continue
+        print(f"Scraping: {word}")
+        data = scrape_word(word, cfg)
+        results.append(data)
+
+    # 結果出力
+    print(json.dumps(results, ensure_ascii=False, indent=2))
+
+if __name__ == "__main__":
+    main()
