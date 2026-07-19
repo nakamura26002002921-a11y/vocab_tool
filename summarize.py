@@ -33,53 +33,34 @@ CSV_FIELDS = [
 ]
 
 # ---------------------------------------------------------------------------
-# プロンプトテンプレート（英語で厳格に指示。ロシア語データはそのまま埋め込む）
+# プロンプトテンプレート（Saiga 2 13B向け：ロシア語で厳格に指示）
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "You are a precise Russian-language lexicographer assistant. "
-    "You extract ONLY facts explicitly present in the provided source data. "
-    "You NEVER invent, guess, or hallucinate information. "
-    "If a field cannot be determined from the source data, you MUST leave it EMPTY. "
-    "You always respond in the exact CSV format requested, with no extra commentary, "
-    "no markdown, no code fences, and no explanations."
+    "Ты — профессиональный лексикограф русского языка. "
+    "Твоя задача — извлечь факты из предоставленных исходных данных и сформировать СТРОГО ОДНУ строку в формате CSV.\n"
+    "АБСОЛЮТНЫЕ ПРАВИЛА (НАРУШЕНИЕ = ОШИБКА):\n"
+    "1. Выводи ТОЛЬКО одну строку данных CSV. Никаких заголовков, никаких пояснений, никаких комментариев после строки.\n"
+    "2. НЕ используй markdown-разметку (никаких ```csv или ```).\n"
+    "3. Часть речи (POS) пиши на русском языке (например: существительное, глагол, прилагательное, наречие, междометие, предлог, союз, частица, местоимение).\n"
+    "4. Род (Gender): мужской, женский или средний (только для существительных, иначе оставь поле пустым).\n"
+    "5. Вид (Aspect): совершенный или несовершенный (только для глаголов, иначе оставь поле пустым).\n"
+    "6. Значения, Коллокации и Примеры должны быть ТОЛЬКО на русском языке (кириллица). Разделяй множественные элементы символом ' | '.\n"
+    "7. Если информации нет в исходных данных, оставляй поле ПУСТЫМ. НЕ пиши 'не указано', 'нет', 'unknown' или прочерк.\n"
+    "8. НЕ используй свои внешние знания для заполнения полей. Используй ТОЛЬКО информацию из раздела 'Исходные данные'.\n"
+    "9. Порядок столбцов строго: Слово,Часть_речи,Род,Вид,Парный_глагол,Значения,Коллокации,Примеры,Ударение.\n"
+    "10. Каждое поле должно быть заключено в двойные кавычки, поля разделены запятыми."
 )
 
 USER_PROMPT_TEMPLATE = """\
-# Task
-Convert the following raw dictionary data about the Russian word "{word}" into \
-EXACTLY ONE CSV row with these 9 fields, in this exact order, separated by commas, \
-with each field wrapped in double quotes:
+Слово: "{word}"
 
-Word,POS,Gender,Aspect,PairedVerb,Meanings_RU,Collocations_RU,Examples_RU,Accent
-
-# Field definitions
-- Word: the headword in Cyrillic, exactly as given.
-- POS: part of speech (e.g. noun, verb, adjective, adverb). Use English terms.
-- Gender: grammatical gender for nouns only (masculine/feminine/neuter). Leave empty if not a noun or unknown.
-- Aspect: verbal aspect for verbs only (perfective/imperfective). Leave empty if not a verb or unknown.
-- PairedVerb: the paired perfective/imperfective verb in Cyrillic, if mentioned in the source. Leave empty if unknown.
-- Meanings_RU: the word's meaning(s), written in Russian (Cyrillic) ONLY, taken from the source. \
-Separate multiple meanings with " / ". Do NOT translate to Japanese or English.
-- Collocations_RU: common collocations or set phrases in Russian (Cyrillic) ONLY, taken from the source. \
-Separate multiple items with " / ". Leave empty if none found in the source.
-- Examples_RU: example sentences in Russian (Cyrillic) ONLY, taken verbatim from the source. \
-Separate multiple examples with " / ". Leave empty if none found in the source.
-- Accent: stress/accent information if present in the source (e.g. which syllable/vowel is stressed). \
-Leave empty if not present in the source.
-
-# Strict rules
-- Use ONLY the information in the "Source data" section below. Do not use outside knowledge.
-- If a field is not present in the source data, leave that field as an empty string "" — do not guess.
-- Do NOT include any Japanese text anywhere in the output.
-- Do NOT include any explanation, preamble, or markdown code fences.
-- Output MUST be exactly one CSV line: 9 comma-separated, double-quoted fields, and nothing else.
-
-# Source data (raw extracted content, may include noise; use only relevant facts)
+Исходные данные (JSON):
 {source_data}
 
-# Output (one CSV line only):
+Сформируй и выведи СТРОГО ОДНУ CSV-строку согласно правилам выше.
+Пример идеального вывода:
+"спасибо","междометие","","","выражение благодарности | благодарность","большое спасибо","Спасибо за помощь. | Спасибо за цветы.","спаси́бо"
 """
-
 
 def build_prompt(word: str, source_data: dict) -> tuple[str, str]:
     """system, user の2つのプロンプト文字列を返す。"""
