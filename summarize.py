@@ -254,13 +254,45 @@ def summarize_word(word: str, scraped_data: dict, config: dict) -> dict:
     return fields
 
 
-if __name__ == "__main__":
-    from common import ensure_db_initialized, load_config
-    from scraping import scrape_word
+import argparse
+from common import ensure_db_initialized, load_config
+from scraping import scrape_word
 
+def main():
+    parser = argparse.ArgumentParser(description="単語リストをスクレイピングするツール")
+    parser.add_argument("--startidx", type=int, default=1, help="開始行 (1始まり)")
+    parser.add_argument("--endidx", type=int, default=100, help="終了行")
+    parser.add_argument("--input", type=str, default="words.txt", help="入力ファイル名")
+    
+    args = parser.parse_args()
+
+    # 設定とDBの初期化
     cfg = load_config()
     ensure_db_initialized(cfg["database"]["path"])
-    test_word = "спасибо"
-    scraped = scrape_word(test_word, cfg)
-    summary = summarize_word(test_word, scraped, cfg)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    # ファイルの読み込み
+    try:
+        with open(args.input, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        print(f"エラー: ファイル '{args.input}' が見つかりません。")
+        return
+
+    # 指定範囲のインデックス調整 (1始まりを0始まりのリストインデックスへ)
+    start = max(0, args.startidx - 1)
+    end = min(len(lines), args.endidx)
+
+    # 処理実行
+    for i in range(start, end):
+        word = lines[i]
+        print(f"[{i + 1}/{len(lines)}] 処理中: {word}")
+        
+        try:
+            scraped = scrape_word(word, cfg)
+            summary = summarize_word(word, scraped, cfg)
+            # 必要に応じて結果の保存処理などをここに記述
+        except Exception as e:
+            print(f"エラー発生 ({word}): {e}")
+
+if __name__ == "__main__":
+    main()
