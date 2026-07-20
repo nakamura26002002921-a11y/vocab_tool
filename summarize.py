@@ -1,22 +1,32 @@
 """
 summarize.py
 ------------
-scraping.py で得た生データを、Ollama経由でSaiga2 13Bに渡し、
+scraping.py で得た生データを、Ollama経由でLLM（デフォルト: Vikhr-Nemo-12B-Instruct）に渡し、
 構造化されたCSV1行分のデータ（Word, POS, Gender, Aspect, PairedVerb,
 Meanings_RU, Collocations_RU, Examples_RU, Accent）に変換するモジュール。
 
 - ハルシネーション防止のため temperature=0.0 を厳守。
-- プロンプトの指示文は英語（Saigaの性能最大化のため）。
+- プロンプトの指示文は英語（モデルの指示追従性能を最大化するため）。
 - 意味・例文等はロシア語原文のまま維持し、日本語訳は含めない。
-- 出力形式はCSV1行（ヘッダなし、パイプ区切り "|" をフィールド内部の区切りに使う）を強制する。
+- LLM出力はJSONオブジェクト1つを要求し、Ollamaネイティブ /api/chat の
+  format パラメータ（JSON Schema）でデコーディング自体を制約することで、
+  「指示を守らずクォート抜けCSVを返す」ような出力崩れを構造的に防ぐ。
+  （OpenAI互換の /v1/chat/completions + response_format はバックエンドによって
+  無視されるケースがあるため使用しない）
 - キャッシュキー: (word, prompt_hash)。プロンプト内容が変わると別キャッシュとして扱われる。
+
+【使用モデルについての注意】
+Ollamaで`hf.co/...`形式のGGUFを直接pullする場合、GGUF内のtokenizer.chat_template
+メタデータが正しく埋め込まれていないと、Ollamaが誤ったプロンプトフォーマットを
+使ってしまい、モデルが学習時と異なる入力を受け取って出力が破綻する
+（文字化けやフォーマット崩れ）ことがある。IlyaGusev/saiga2_13b_gguf（2023年当時の
+変換）はこの問題が起きたため、chat_templateメタデータが正しく設定されている
+bartowski/Vikhr-Nemo-12B-Instruct-R-21-09-24-GGUF に切り替えた。
 """
 
 from __future__ import annotations
 
-import csv
 import hashlib
-import io
 import json
 import time
 from typing import Optional
@@ -39,45 +49,45 @@ SYSTEM_PROMPT = (
     "You are a precise Russian-language lexicographer assistant. "
     "You extract ONLY facts explicitly present in the provided source data. "
     "You NEVER invent, guess, or hallucinate information. "
-    "If a field cannot be determined from the source data, you MUST leave it EMPTY. "
-    "You always respond in the exact CSV format requested, with no extra commentary, "
-    "no markdown, no code fences, and no explanations."
+    "If a field cannot be determined from the source data, you MUST use an empty string for it. "
+    "You always respond with a single valid JSON object in the exact format requested, "
+    "with no extra commentary, no markdown, no code fences, and no explanations."
 )
 
 USER_PROMPT_TEMPLATE = """\
 # Task
 Convert the following raw dictionary data about the Russian word "{word}" into \
-EXACTLY ONE CSV row with these 9 fields, in this exact order, separated by commas, \
-with each field wrapped in double quotes:
+a single JSON object with EXACTLY these 9 keys, in this exact order:
 
-Word,POS,Gender,Aspect,PairedVerb,Meanings_RU,Collocations_RU,Examples_RU,Accent
+Word, POS, Gender, Aspect, PairedVerb, Meanings_RU, Collocations_RU, Examples_RU, Accent
 
 # Field definitions
 - Word: the headword in Cyrillic, exactly as given.
 - POS: part of speech (e.g. noun, verb, adjective, adverb). Use English terms.
-- Gender: grammatical gender for nouns only (masculine/feminine/neuter). Leave empty if not a noun or unknown.
-- Aspect: verbal aspect for verbs only (perfective/imperfective). Leave empty if not a verb or unknown.
-- PairedVerb: the paired perfective/imperfective verb in Cyrillic, if mentioned in the source. Leave empty if unknown.
+- Gender: grammatical gender for nouns only (masculine/feminine/neuter). Leave empty string if not a noun or unknown.
+- Aspect: verbal aspect for verbs only (perfective/imperfective). Leave empty string if not a verb or unknown.
+- PairedVerb: the paired perfective/imperfective verb in Cyrillic, if mentioned in the source. Leave empty string if unknown.
 - Meanings_RU: the word's meaning(s), written in Russian (Cyrillic) ONLY, taken from the source. \
 Separate multiple meanings with " / ". Do NOT translate to Japanese or English.
 - Collocations_RU: common collocations or set phrases in Russian (Cyrillic) ONLY, taken from the source. \
-Separate multiple items with " / ". Leave empty if none found in the source.
+Separate multiple items with " / ". Leave empty string if none found in the source.
 - Examples_RU: example sentences in Russian (Cyrillic) ONLY, taken verbatim from the source. \
-Separate multiple examples with " / ". Leave empty if none found in the source.
+Separate multiple examples with " / ". Leave empty string if none found in the source.
 - Accent: stress/accent information if present in the source (e.g. which syllable/vowel is stressed). \
-Leave empty if not present in the source.
+Leave empty string if not present in the source.
 
 # Strict rules
 - Use ONLY the information in the "Source data" section below. Do not use outside knowledge.
-- If a field is not present in the source data, leave that field as an empty string "" — do not guess.
+- If a field is not present in the source data, use an empty string "" as its value — do not guess.
+- Every value MUST be a plain JSON string (never a nested object, array, or number).
 - Do NOT include any Japanese text anywhere in the output.
 - Do NOT include any explanation, preamble, or markdown code fences.
-- Output MUST be exactly one CSV line: 9 comma-separated, double-quoted fields, and nothing else.
+- Output MUST be exactly one JSON object and nothing else — no text before or after it.
 
 # Source data (raw extracted content, may include noise; use only relevant facts)
 {source_data}
 
-# Output (one CSV line only):
+# Output (one JSON object only, e.g. {{"Word": "...", "POS": "...", ...}}):
 """
 
 def build_prompt(word: str, source_data: dict) -> tuple[str, str]:
@@ -92,11 +102,27 @@ def compute_prompt_hash(system_prompt: str, user_prompt: str, model: str) -> str
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+# Ollama の /api/chat エンドポイントに渡す JSON Schema（format パラメータ）。
+# これによりデコーディング自体がこのスキーマに従うよう制約され、
+# モデルが指示を「破る」形での出力崩れ（例: クォート抜けCSV）を構造的に防げる。
+# 参考: https://docs.ollama.com/api/openai-compatibility の response_format は
+# 実装によって無視されることがあるため、Ollamaネイティブの /api/chat + format を使う。
+_RESPONSE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {field: {"type": "string"} for field in CSV_FIELDS},
+    "required": CSV_FIELDS,
+}
+
+
 # ---------------------------------------------------------------------------
 # Ollama呼び出し
 # ---------------------------------------------------------------------------
 def call_ollama(system_prompt: str, user_prompt: str, llm_config: dict) -> Optional[str]:
-    url = f"{llm_config['base_url']}/v1/chat/completions"
+    """Ollamaネイティブ API (/api/chat) を、format パラメータでJSON Schemaを
+    指定して呼び出す。これによりモデルの出力トークンがスキーマに適合する
+    JSONのみに制約される（llama.cppのgrammar-constrained decodingを利用）。
+    """
+    url = f"{llm_config['base_url']}/api/chat"
     headers = {"Content-Type": "application/json"}
     payload = {
         "model": llm_config["model"],
@@ -104,8 +130,11 @@ def call_ollama(system_prompt: str, user_prompt: str, llm_config: dict) -> Optio
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": llm_config.get("temperature", 0.0),
-        "max_tokens": llm_config.get("max_tokens", 1024),
+        "format": _RESPONSE_JSON_SCHEMA,
+        "options": {
+            "temperature": llm_config.get("temperature", 0.0),
+            "num_predict": llm_config.get("max_tokens", 1024),
+        },
         "stream": False,
     }
 
@@ -117,12 +146,9 @@ def call_ollama(system_prompt: str, user_prompt: str, llm_config: dict) -> Optio
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
             resp.raise_for_status()
             result = resp.json()
-            choices = result.get("choices")
-            if not choices:
-                raise ValueError(f"No choices in response: {result}")
-            content = choices[0].get("message", {}).get("content", "").strip()
+            content = result.get("message", {}).get("content", "").strip()
             if not content:
-                raise ValueError("Empty content in response")
+                raise ValueError(f"Empty content in response: {result}")
             return content
         except Exception as e:  # noqa: BLE001
             logger.warning(
@@ -138,32 +164,60 @@ def call_ollama(system_prompt: str, user_prompt: str, llm_config: dict) -> Optio
 # ---------------------------------------------------------------------------
 # LLM出力のパース
 # ---------------------------------------------------------------------------
-def parse_csv_line(word: str, llm_output: str) -> dict:
-    """LLMが返したCSV1行をパースしてdictに変換する。
+def _extract_json_object(text: str) -> str:
+    """テキストから最初の { に対応する } までの範囲を波括弧の深さを数えて
+    切り出す。モデルが前後に余計な説明文を付けてきた場合の保険。
+    見つからなければ元のテキストをそのまま返す（後段のjson.loadsで失敗させる）。
+    """
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text[start:]
+
+
+def _stringify(value) -> str:
+    """LLMが文字列であるべき値を誤って配列やオブジェクトで返した場合の保険。
+    リストは " / " 区切りの文字列に、それ以外の非文字列はそのまま str() する。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return " / ".join(_stringify(v) for v in value if _stringify(v))
+    return str(value).strip()
+
+
+def parse_json_object(word: str, llm_output: str) -> dict:
+    """LLMが返したJSONオブジェクトをパースしてdictに変換する。
     パースに失敗した場合は Word 以外を空欄にしたdictを返す（呼び出し側でエラー扱い可能）。
     """
-    cleaned = strip_code_fences(llm_output)
-    # 複数行返ってきた場合は、カンマを含む最初の妥当そうな行を採用する
-    candidate_line = cleaned.splitlines()[0] if cleaned.splitlines() else cleaned
-
-    try:
-        reader = csv.reader(io.StringIO(candidate_line), skipinitialspace=True)
-        row = next(reader)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("summarize: CSV parse failed word=%s error=%s raw=%s", word, e, llm_output[:200])
-        row = []
-
     result = {field: "" for field in CSV_FIELDS}
     result["Word"] = word  # Wordは常に入力単語で上書き（LLMの表記揺れ対策）
 
-    if len(row) >= len(CSV_FIELDS):
-        for field, value in zip(CSV_FIELDS[1:], row[1:len(CSV_FIELDS)]):
-            result[field] = value.strip()
-    else:
-        logger.warning(
-            "summarize: unexpected field count word=%s expected=%d got=%d raw=%s",
-            word, len(CSV_FIELDS), len(row), llm_output[:200],
-        )
+    cleaned = strip_code_fences(llm_output)
+    json_text = _extract_json_object(cleaned)
+
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        logger.warning("summarize: JSON parse failed word=%s error=%s raw=%s", word, e, llm_output[:300])
+        return result
+
+    if not isinstance(parsed, dict):
+        logger.warning("summarize: JSON output is not an object word=%s raw=%s", word, llm_output[:300])
+        return result
+
+    for field in CSV_FIELDS[1:]:  # Word以外
+        if field in parsed:
+            result[field] = _stringify(parsed[field])
 
     return result
 
@@ -247,7 +301,7 @@ def summarize_word(word: str, scraped_data: dict, config: dict) -> dict:
     if llm_output is None:
         raise SummarizeError(f"LLM呼び出しに失敗しました（word={word}, model={llm_config['model']}）")
 
-    fields = parse_csv_line(word, llm_output)
+    fields = parse_json_object(word, llm_output)
     _save_to_cache(db_path, word, prompt_hash, llm_config["model"], fields, llm_output)
 
     return fields
