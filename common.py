@@ -146,7 +146,7 @@ def record_error(db_path: str, word: str, stage: str, message: str) -> None:
 # 汎用テキスト処理
 # ---------------------------------------------------------------------------
 def strip_code_fences(text: str) -> str:
-    text = re.sub(r"^```(?:csv|text)?\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^```(?:csv|text|json)?\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
     return text.strip()
 
