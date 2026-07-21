@@ -1,9 +1,23 @@
 """
 summarize.py
 ------------
-scraping.py で得た生データを、Ollama経由でLLM（デフォルト: Vikhr-Nemo-12B-Instruct）に渡し、
+scraping.py で得た生データ（wikitextのテンプレート記法除去やHTML構造の細部までは
+完全にクリーンアップされていない、多少ノイズを含む可能性のあるテキスト）を、
+Ollama経由でLLM（デフォルト: Vikhr-Nemo-12B-Instruct、ロシア語に強いモデル）に渡し、
 構造化されたCSV1行分のデータ（Word, POS, Gender, Aspect, PairedVerb,
 Meanings_RU, Collocations_RU, Examples_RU, Accent）に変換するモジュール。
+
+【設計方針: パース精度の一部をLLMに委譲する】
+scraping.py 側の正規表現パーサは、MediaWikiテンプレート（{{семантика|...}}等）の
+複雑な折り返しパターンを100%決定論的に処理しようとすると際限なくコストが増える。
+一方、ロシア語に強いLLMは「テンプレート除去の残骸らしきゴミを無視する」
+「意味の区切りを正しく判断する」といった言語理解が要る作業を、正規表現よりずっと
+頑健にこなせる。そのため、scraping.py側では過度に厳密なクリーンアップを行わず、
+多少ノイズ・記法の残骸が残っていてもよいテキストを渡し、意味的な整形・ノイズ除去は
+プロンプトで明示的にLLM側の仕事として指示している（下記 USER_PROMPT_TEMPLATE の
+「Handling noisy input」セクション）。ただし「ソースにない事実を作らない」という
+ハルシネーション禁止の原則は変えない。ノイズの除去・整形は許容するが、情報の捏造は
+許容しない、という線引き。
 
 - ハルシネーション防止のため temperature=0.0 を厳守。
 - プロンプトの指示文は英語（モデルの指示追従性能を最大化するため）。
@@ -47,8 +61,15 @@ CSV_FIELDS = [
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
     "You are a precise Russian-language lexicographer assistant. "
-    "You extract ONLY facts explicitly present in the provided source data. "
-    "You NEVER invent, guess, or hallucinate information. "
+    "You extract and normalize facts explicitly present in the provided source data. "
+    "The source data comes from an automated scraping/parsing pipeline and MAY contain "
+    "noise: leftover MediaWiki template syntax (e.g. stray braces, pipe-separated "
+    "parameter fragments like 'синонимы=' or 'антонимы=-'), broken punctuation from "
+    "template removal (stray leading/trailing commas), HTML tag remnants, or duplicated "
+    "fragments. Using your knowledge of Russian, you should recognize and silently ignore "
+    "such noise, and reconstruct the intended clean meaning/example/collocation text. "
+    "You NEVER invent, guess, or hallucinate facts that are not present in the source data "
+    "in some form — cleaning up noise and formatting is allowed, inventing new content is not. "
     "If a field cannot be determined from the source data, you MUST use an empty string for it. "
     "You always respond with a single valid JSON object in the exact format requested, "
     "with no extra commentary, no markdown, no code fences, and no explanations."
@@ -61,18 +82,36 @@ a single JSON object with EXACTLY these 9 keys, in this exact order:
 
 Word, POS, Gender, Aspect, PairedVerb, Meanings_RU, Collocations_RU, Examples_RU, Accent
 
+# Handling noisy input
+The source data below was produced by an automated scraper and is NOT guaranteed to be \
+perfectly clean. It may contain:
+- Leftover MediaWiki template fragments (e.g. stray "{{{{", "}}}}", "|синонимы=", \
+"|антонимы=-", parameter names without values).
+- Stray leading/trailing commas, semicolons, or whitespace left over from template removal.
+- HTML tags or entities that were not fully stripped.
+- Section text that runs together without clear boundaries.
+When you encounter such noise, use your understanding of Russian and of dictionary structure \
+to silently discard the noise and reconstruct the clean, intended text. For example, a meaning \
+entry like ",  конфликтный разговор, ссора" should become "конфликтный разговор, ссора" \
+(the leading comma/space is noise, not part of the meaning). An entry that is only noise \
+(e.g. just "," or an empty template fragment) should be discarded entirely, not included as \
+an empty or near-empty item.
+This noise-cleaning applies to formatting and boundaries ONLY — never add information, \
+translations, or details that are not derivable from the source text itself.
+
 # Field definitions
 - Word: the headword in Cyrillic, exactly as given.
 - POS: part of speech (e.g. noun, verb, adjective, adverb). Use English terms.
 - Gender: grammatical gender for nouns only (masculine/feminine/neuter). Leave empty string if not a noun or unknown.
 - Aspect: verbal aspect for verbs only (perfective/imperfective). Leave empty string if not a verb or unknown.
 - PairedVerb: the paired perfective/imperfective verb in Cyrillic, if mentioned in the source. Leave empty string if unknown.
-- Meanings_RU: the word's meaning(s), written in Russian (Cyrillic) ONLY, taken from the source. \
+- Meanings_RU: the word's distinct meaning(s), written in Russian (Cyrillic) ONLY, taken from the source. \
+Each meaning should be a clean, complete phrase with no leftover markup or stray punctuation. \
 Separate multiple meanings with " / ". Do NOT translate to Japanese or English.
 - Collocations_RU: common collocations or set phrases in Russian (Cyrillic) ONLY, taken from the source. \
 Separate multiple items with " / ". Leave empty string if none found in the source.
-- Examples_RU: example sentences in Russian (Cyrillic) ONLY, taken verbatim from the source. \
-Separate multiple examples with " / ". Leave empty string if none found in the source.
+- Examples_RU: example sentences in Russian (Cyrillic) ONLY, taken verbatim (aside from noise removal) \
+from the source. Separate multiple examples with " / ". Leave empty string if none found in the source.
 - Accent: stress/accent information if present in the source (e.g. which syllable/vowel is stressed). \
 Leave empty string if not present in the source.
 
@@ -84,7 +123,8 @@ Leave empty string if not present in the source.
 - Do NOT include any explanation, preamble, or markdown code fences.
 - Output MUST be exactly one JSON object and nothing else — no text before or after it.
 
-# Source data (raw extracted content, may include noise; use only relevant facts)
+# Source data (raw extracted content — may include scraping/parsing noise as described above; \
+use your judgment to extract only the genuine, relevant facts)
 {source_data}
 
 # Output (one JSON object only, e.g. {{"Word": "...", "POS": "...", ...}}):
