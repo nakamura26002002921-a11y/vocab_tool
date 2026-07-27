@@ -13,7 +13,7 @@
   },
 
   "polish_llm": {
-    "model": "qwen2.5:14b",
+    "model": "qwen3:14b",
     "base_url": "${OLLAMA_BASE_URL:-http://localhost:11434}",
     "temperature": 0.0,
     "max_tokens": 1024,
