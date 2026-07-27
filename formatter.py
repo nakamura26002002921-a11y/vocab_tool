@@ -199,6 +199,7 @@ def polish_llm(word, ru, mt, llm_config):
     )
     payload = {
         "model": llm_config["model"],
+        "think": False,
         "stream": False,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
