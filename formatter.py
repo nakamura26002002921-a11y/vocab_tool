@@ -393,12 +393,22 @@ def translate_and_polish(word, ru, cfg, translator, translation_cfg, only_mt=Fal
     return ja
 
 
-def write_csv(rows, output_file, use_bom=True):
+def open_csv_writer(output_file, use_bom=True):
+    """出力CSVを新規作成し、ヘッダーを書き込んだ上で writer とファイルハンドルを返す。
+    以降は呼び出し側が1件処理するたびに writer.writerow() し、
+    append_csv_row() で都度 flush することで、途中でエラーが起きてもそれまでの分は保存される。"""
     encoding = "utf-8-sig" if use_bom else "utf-8"
-    with open(output_file, "w", newline="", encoding=encoding) as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-        writer.writeheader()
-        writer.writerows(rows)
+    f = open(output_file, "w", newline="", encoding=encoding)
+    writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+    writer.writeheader()
+    f.flush()
+    return writer, f
+
+
+def append_csv_row(writer, f, row):
+    """1行を書き込み、即座にディスクへ反映する（=途中終了しても書き込み済み分は失われない）。"""
+    writer.writerow(row)
+    f.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -466,36 +476,47 @@ def main():
     end = min(len(words), args.endidx)
     target_words = words[start:end]
 
-    rows = []
-    for i, word in enumerate(target_words, start=start + 1):
-        print(f"[{i}/{len(words)}] 処理中: {word}")
+    writer, f = open_csv_writer(output_file, use_bom=use_bom)
+    written_count = 0
+    try:
+        for i, word in enumerate(target_words, start=start + 1):
+            print(f"[{i}/{len(words)}] 処理中: {word}")
 
-        ru = get_summary(db_path, word)
-        if not ru:
-            print(f"  -> DBに見つからないためスキップ: {word}")
-            continue  # DBになければスキップ（エラー行は出力しない）
-
-        ja = {"Meanings_JA": "", "Collocations_JA": "", "Examples_JA": ""}
-        if translate_enabled:
             try:
-                ja = translate_and_polish(
-                    word, ru, cfg, translator, translation_cfg,
-                    only_mt=args.onlyMT, llm_only=args.llmOnly,
-                )
+                ru = get_summary(db_path, word)
+                if not ru:
+                    print(f"  -> DBに見つからないためスキップ: {word}")
+                    continue  # DBになければスキップ（エラー行は出力しない）
+
+                ja = {"Meanings_JA": "", "Collocations_JA": "", "Examples_JA": ""}
+                if translate_enabled:
+                    try:
+                        ja = translate_and_polish(
+                            word, ru, cfg, translator, translation_cfg,
+                            only_mt=args.onlyMT, llm_only=args.llmOnly,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("formatter: 翻訳処理に失敗 word=%s error=%s", word, e)
+
+                append_csv_row(writer, f, {
+                    "Word": ru["word"], "POS": ru["pos"], "Gender": ru["gender"],
+                    "Aspect": ru["aspect"], "PairedVerb": ru["paired_verb"],
+                    "Meanings_RU": ru["meanings_ru"], "Meanings_JA": ja["Meanings_JA"],
+                    "Collocations_RU": ru["collocations_ru"], "Collocations_JA": ja["Collocations_JA"],
+                    "Examples_RU": ru["examples_ru"], "Examples_JA": ja["Examples_JA"],
+                    "Accent": ru["accent"],
+                })
+                written_count += 1
             except Exception as e:  # noqa: BLE001
-                logger.warning("formatter: 翻訳処理に失敗 word=%s error=%s", word, e)
+                # 1単語分の処理で予期しない例外が起きても、それまでの書き込み済み分は
+                # すでにディスクへ flush 済みなので失われない。ログを残して次の単語へ進む。
+                logger.warning("formatter: 単語の処理中に予期しないエラー word=%s error=%s", word, e)
+                print(f"  -> エラーが発生したためスキップ: {word} ({e})")
+                continue
+    finally:
+        f.close()
 
-        rows.append({
-            "Word": ru["word"], "POS": ru["pos"], "Gender": ru["gender"],
-            "Aspect": ru["aspect"], "PairedVerb": ru["paired_verb"],
-            "Meanings_RU": ru["meanings_ru"], "Meanings_JA": ja["Meanings_JA"],
-            "Collocations_RU": ru["collocations_ru"], "Collocations_JA": ja["Collocations_JA"],
-            "Examples_RU": ru["examples_ru"], "Examples_JA": ja["Examples_JA"],
-            "Accent": ru["accent"],
-        })
-
-    write_csv(rows, output_file, use_bom=use_bom)
-    print(f"完了: {len(rows)}件を '{output_file}' に書き出しました。")
+    print(f"完了: {written_count}件を '{output_file}' に書き出しました。")
 
 
 if __name__ == "__main__":
