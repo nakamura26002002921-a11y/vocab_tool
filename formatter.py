@@ -434,10 +434,17 @@ def polish_japanese_with_llm(word: str, ru_fields: dict, mt_fields: dict, cfg: d
 # ---------------------------------------------------------------------------
 # オーケストレーション: 機械翻訳 → LLM整形 → キャッシュ
 # ---------------------------------------------------------------------------
-def translate_and_polish(word: str, ru_fields: dict, cfg: dict, translator, translation_cfg: dict) -> dict:
+def translate_and_polish(
+    word: str, ru_fields: dict, cfg: dict, translator, translation_cfg: dict, only_mt: bool = False
+) -> dict:
+    """機械翻訳→(オプションで)LLM整形までを行う。
+
+    only_mt=True の場合、LLM整形を完全にスキップし、Google翻訳の結果をそのまま採用する
+    （config.json の translation.polish_with_llm 設定より優先される、呼び出し側の明示的な指定）。
+    """
     db_path = cfg["database"]["path"]
     delay = translation_cfg.get("request_delay_seconds", 1.0)
-    polish_enabled = translation_cfg.get("polish_with_llm", True)
+    polish_enabled = translation_cfg.get("polish_with_llm", True) and not only_mt
 
     source_hash = compute_source_hash(
         ru_fields.get("Meanings_RU", ""),
@@ -480,6 +487,11 @@ def main():
         "--no-translate", action="store_true",
         help="日本語訳を付けず、ロシア語原文のみでCSVを出力する（動作確認・高速テスト用）",
     )
+    parser.add_argument(
+        "--onlyMT", action="store_true",
+        help="日本語訳はGoogle翻訳の結果のみを採用し、LLMによる整形ステップを完全にスキップする"
+             "（LLM整形の妥当性を検証したい場合や、LLM(Ollama)サーバを起動していない場合に使用）",
+    )
 
     args = parser.parse_args()
 
@@ -511,6 +523,10 @@ def main():
         except RuntimeError as e:
             print(f"警告: {e}\n日本語訳なし（ロシア語原文のみ）で続行します。")
             translate_enabled = False
+
+    if translate_enabled:
+        mode = "Google翻訳のみ（LLM整形スキップ / --onlyMT）" if args.onlyMT else "Google翻訳 + LLM整形"
+        print(f"日本語訳モード: {mode}")
 
     # ファイルの読み込み
     try:
@@ -545,7 +561,9 @@ def main():
 
         if translate_enabled:
             try:
-                ja_fields = translate_and_polish(word, ru_fields, cfg, translator, translation_cfg)
+                ja_fields = translate_and_polish(
+                    word, ru_fields, cfg, translator, translation_cfg, only_mt=args.onlyMT
+                )
                 row.update(ja_fields)
                 translated_count += 1
             except Exception as e:  # noqa: BLE001
