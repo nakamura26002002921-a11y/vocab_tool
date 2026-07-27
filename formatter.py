@@ -189,8 +189,9 @@ def translate(text, translator, delay=1.0):
 # 2段階目: ローカルLLMによる日本語の整形
 # ---------------------------------------------------------------------------
 def polish_llm(word, ru, mt, llm_config):
-    """Ollamaで日本語を整形する。失敗時はリトライし、最終的に例外を送出する
-    （呼び出し側でmtへのフォールバックを行う想定）。"""
+    """Ollamaで日本語を整形する（`llm_config` は config.json の `polish_llm` セクション、
+    つまり summarize.py 用モデルとは別の日本語整形専用モデルの設定を想定）。
+    失敗時はリトライし、最終的に例外を送出する（呼び出し側でmtへのフォールバックを行う想定）。"""
     prompt = USER_PROMPT_TEMPLATE.format(
         word=word,
         meanings_ru=ru["meanings_ru"], collocations_ru=ru["collocations_ru"], examples_ru=ru["examples_ru"],
@@ -242,6 +243,13 @@ def polish_llm(word, ru, mt, llm_config):
 # ---------------------------------------------------------------------------
 # オーケストレーション: 機械翻訳 → (オプションで)LLM整形 → キャッシュ
 # ---------------------------------------------------------------------------
+def get_polish_llm_config(cfg):
+    """日本語整形専用のLLM設定を取得する。
+    `polish_llm` セクションが無い古い config.json との互換のため、
+    無ければ summarize.py 用の `llm` セクションにフォールバックする。"""
+    return cfg.get("polish_llm") or cfg["llm"]
+
+
 def translate_and_polish(word, ru, cfg, translator, translation_cfg, only_mt=False):
     db_path = cfg["database"]["path"]
     delay = translation_cfg.get("request_delay_seconds", 1.0)
@@ -262,9 +270,10 @@ def translate_and_polish(word, ru, cfg, translator, translation_cfg, only_mt=Fal
     ja = dict(mt)
     polish_model = ""
     if polish_enabled and any(mt.values()):
+        polish_llm_config = get_polish_llm_config(cfg)
         try:
-            ja = polish_llm(word, ru, mt, cfg["llm"])
-            polish_model = cfg["llm"]["model"]
+            ja = polish_llm(word, ru, mt, polish_llm_config)
+            polish_model = polish_llm_config["model"]
         except Exception as e:  # noqa: BLE001
             logger.warning("formatter: LLM整形に失敗、機械翻訳の結果を採用 word=%s error=%s", word, e)
             ja = dict(mt)
