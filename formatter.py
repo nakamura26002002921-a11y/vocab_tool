@@ -20,7 +20,7 @@ CSV_HEADER = [
     "Accent",
 ]
 
-# --- LLM用プロンプト ---
+# --- LLM用プロンプト（MT結果を整形するモード） ---
 SYSTEM_PROMPT = (
     "You are a meticulous Japanese editor working on a Russian-Japanese dictionary. "
     "You will be given a Russian original text and its raw machine translation into Japanese. "
@@ -57,6 +57,32 @@ Examples_JA: {examples_ja_mt}
 {{"Meanings_JA": "...", "Collocations_JA": "...", "Examples_JA": "..."}}
 """
 
+# --- LLM用プロンプト（MTを介さず、ロシア語原文から直接翻訳するモード） ---
+DIRECT_SYSTEM_PROMPT = (
+    "You are a meticulous Japanese lexicographer working on a Russian-Japanese dictionary. "
+    "You will be given Russian dictionary content (word meanings, collocations, and example "
+    "sentences) and must translate it directly into natural, dictionary-style Japanese. "
+    "Do not add information beyond what the Russian original conveys. "
+    "Keep the exact number of ' / '-separated items in each field, in the same order. "
+    "Output valid JSON only."
+)
+
+DIRECT_USER_PROMPT_TEMPLATE = """\
+# Task
+Translate the following Russian dictionary content for the word "{word}" directly into Japanese.
+Produce natural, concise, dictionary-style Japanese. Preserve the number and order of
+' / '-separated items in each field.
+
+# Russian original
+Meanings_RU: {meanings_ru}
+Collocations_RU: {collocations_ru}
+Examples_RU: {examples_ru}
+
+# Output JSON format
+{{"Meanings_JA": "...", "Collocations_JA": "...", "Examples_JA": "..."}}
+"""
+
+
 # ---------------------------------------------------------------------------
 # DB読み込み
 # ---------------------------------------------------------------------------
@@ -84,7 +110,8 @@ def get_summary(db_path, word):
 def ensure_translation_cache_table(db_path):
     """translations_ja テーブルが無ければ作成する。
     Google翻訳結果(mt_*)とLLM整形後の結果(ja_*)を両方保存し、
-    ロシア語原文が変わらない限り再翻訳・再整形しない（速度・コスト対策）。"""
+    ロシア語原文が変わらない限り再翻訳・再整形しない（速度・コスト対策）。
+    mt_engine には "google" / "llm_direct" のように翻訳経路を記録する。"""
     with get_connection(db_path) as conn:
         conn.execute(
             """
@@ -92,14 +119,14 @@ def ensure_translation_cache_table(db_path):
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 word            TEXT NOT NULL,
                 source_hash     TEXT NOT NULL,  -- RU原文(Meanings/Collocations/Examples)のハッシュ
-                meanings_mt     TEXT,           -- Google翻訳結果（整形前）
+                meanings_mt     TEXT,           -- Google翻訳結果（整形前。LLM直接翻訳時は空）
                 collocations_mt TEXT,
                 examples_mt     TEXT,
-                meanings_ja     TEXT,           -- 最終採用値（LLM整形後 or MTそのまま）
+                meanings_ja     TEXT,           -- 最終採用値（LLM整形後 / LLM直接翻訳 / MTそのまま）
                 collocations_ja TEXT,
                 examples_ja     TEXT,
-                mt_engine       TEXT,
-                polish_model    TEXT,           -- LLM整形に使ったモデル名（未整形なら空文字）
+                mt_engine       TEXT,           -- "google" or "llm_direct"
+                polish_model    TEXT,           -- LLM整形/直接翻訳に使ったモデル名（未使用なら空文字）
                 created_at      TEXT NOT NULL,
                 UNIQUE(word, source_hash)
             )
@@ -197,7 +224,7 @@ def translate(text, translator, delay=1.0):
 
 
 # ---------------------------------------------------------------------------
-# 2段階目: ローカルLLMによる日本語の整形
+# 2段階目: ローカルLLMによる日本語の整形（MT結果を修正するモード）
 # ---------------------------------------------------------------------------
 def polish_llm(word, ru, mt, llm_config):
     """Ollamaで日本語を整形する（`llm_config` は config.json の `polish_llm` セクション、
@@ -253,25 +280,97 @@ def polish_llm(word, ru, mt, llm_config):
 
 
 # ---------------------------------------------------------------------------
+# 代替経路: MTを介さず、ロシア語原文をLLMに直接翻訳させる（--llmOnly）
+# ---------------------------------------------------------------------------
+def translate_direct_llm(word, ru, llm_config):
+    """MTを介さず、ロシア語原文を直接LLMに翻訳させる。
+    `llm_config` は polish_llm と同じ設定（`polish_llm` セクション、なければ `llm`）を流用する。
+    失敗時はリトライし、最終的に例外を送出する。"""
+    prompt = DIRECT_USER_PROMPT_TEMPLATE.format(
+        word=word,
+        meanings_ru=ru["meanings_ru"], collocations_ru=ru["collocations_ru"], examples_ru=ru["examples_ru"],
+    )
+    payload = {
+        "model": llm_config["model"],
+        "think": False,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": DIRECT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "format": {
+            "type": "object",
+            "properties": {
+                "Meanings_JA": {"type": "string"},
+                "Collocations_JA": {"type": "string"},
+                "Examples_JA": {"type": "string"},
+            },
+            "required": ["Meanings_JA", "Collocations_JA", "Examples_JA"],
+        },
+        "options": {
+            "temperature": llm_config.get("temperature", 0.0),
+            "num_predict": llm_config.get("max_tokens", 1024),
+        },
+    }
+    url = f"{llm_config['base_url']}/api/chat"
+    max_retries = max(1, llm_config.get("max_retries", 2))
+    timeout = llm_config.get("timeout_seconds", 120)
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = requests.post(url, json=payload, timeout=timeout)
+            res.raise_for_status()
+            content = res.json()["message"]["content"]
+            return json.loads(content)
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            logger.warning(
+                "formatter: LLM直接翻訳呼び出しに失敗 (attempt %d/%d) word=%s error=%s",
+                attempt, max_retries, word, e,
+            )
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+    raise RuntimeError(f"LLM直接翻訳に失敗しました: word={word}") from last_error
+
+
+# ---------------------------------------------------------------------------
 # オーケストレーション: 機械翻訳 → (オプションで)LLM整形 → キャッシュ
+#                       または、LLM直接翻訳 → キャッシュ（--llmOnly）
 # ---------------------------------------------------------------------------
 def get_polish_llm_config(cfg):
-    """日本語整形専用のLLM設定を取得する。
+    """日本語整形/直接翻訳専用のLLM設定を取得する。
     `polish_llm` セクションが無い古い config.json との互換のため、
     無ければ summarize.py 用の `llm` セクションにフォールバックする。"""
     return cfg.get("polish_llm") or cfg["llm"]
 
 
-def translate_and_polish(word, ru, cfg, translator, translation_cfg, only_mt=False):
+def translate_and_polish(word, ru, cfg, translator, translation_cfg, only_mt=False, llm_only=False):
     db_path = cfg["database"]["path"]
     delay = translation_cfg.get("request_delay_seconds", 1.0)
-    polish_enabled = translation_cfg.get("polish_with_llm", True) and not only_mt
+    polish_enabled = translation_cfg.get("polish_with_llm", True) and not only_mt and not llm_only
 
     source_hash = compute_source_hash(ru["meanings_ru"], ru["collocations_ru"], ru["examples_ru"])
 
     cached = load_translation_from_cache(db_path, word, source_hash)
     if cached is not None:
         return cached
+
+    if llm_only:
+        # MTを完全にスキップし、LLMにロシア語原文を直接日本語へ翻訳させる
+        polish_llm_config = get_polish_llm_config(cfg)
+        try:
+            ja = translate_direct_llm(word, ru, polish_llm_config)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("formatter: LLM直接翻訳に失敗、空文字で出力 word=%s error=%s", word, e)
+            ja = {"Meanings_JA": "", "Collocations_JA": "", "Examples_JA": ""}
+
+        mt_placeholder = {"Meanings_JA": "", "Collocations_JA": "", "Examples_JA": ""}
+        save_translation_to_cache(
+            db_path, word, source_hash, mt_placeholder, ja,
+            mt_engine="llm_direct", polish_model=polish_llm_config["model"],
+        )
+        return ja
 
     mt = {
         "Meanings_JA": translate(ru["meanings_ru"], translator, delay),
@@ -322,7 +421,15 @@ def main():
         help="日本語訳はGoogle翻訳の結果のみを採用し、LLMによる整形ステップを完全にスキップする"
              "（LLM(Ollama)サーバを起動していない場合や、LLM整形の要否を検証したい場合に使用）",
     )
+    parser.add_argument(
+        "--llmOnly", action="store_true",
+        help="Google翻訳(MT)を使わず、LLM(qwen3など)にロシア語原文を直接日本語へ翻訳させる"
+             "（MTの誤訳をそもそも経由させたくない場合に使用。--onlyMT とは併用不可）",
+    )
     args = parser.parse_args()
+
+    if args.onlyMT and args.llmOnly:
+        parser.error("--onlyMT と --llmOnly は同時に指定できません")
 
     cfg = load_config()
     db_path = cfg["database"]["path"]
@@ -340,11 +447,15 @@ def main():
     translator = None
     if translate_enabled:
         ensure_translation_cache_table(db_path)
-        translator = GoogleTranslator(
-            source=translation_cfg.get("source_lang", "ru"),
-            target=translation_cfg.get("target_lang", "ja"),
-        )
-        mode = "Google翻訳のみ（LLM整形スキップ / --onlyMT）" if args.onlyMT else "Google翻訳 + LLM整形"
+        if args.llmOnly:
+            # Google翻訳は使わないため、GoogleTranslator は生成しない
+            mode = "LLM直接翻訳のみ（Google翻訳スキップ / --llmOnly）"
+        else:
+            translator = GoogleTranslator(
+                source=translation_cfg.get("source_lang", "ru"),
+                target=translation_cfg.get("target_lang", "ja"),
+            )
+            mode = "Google翻訳のみ（LLM整形スキップ / --onlyMT）" if args.onlyMT else "Google翻訳 + LLM整形"
         print(f"日本語訳モード: {mode}")
 
     with open(args.input, "r", encoding="utf-8") as f:
@@ -367,7 +478,10 @@ def main():
         ja = {"Meanings_JA": "", "Collocations_JA": "", "Examples_JA": ""}
         if translate_enabled:
             try:
-                ja = translate_and_polish(word, ru, cfg, translator, translation_cfg, only_mt=args.onlyMT)
+                ja = translate_and_polish(
+                    word, ru, cfg, translator, translation_cfg,
+                    only_mt=args.onlyMT, llm_only=args.llmOnly,
+                )
             except Exception as e:  # noqa: BLE001
                 logger.warning("formatter: 翻訳処理に失敗 word=%s error=%s", word, e)
 
