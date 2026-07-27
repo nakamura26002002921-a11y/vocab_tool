@@ -12,6 +12,15 @@
     "max_retries": 2
   },
 
+  "polish_llm": {
+    "model": "qwen2.5:14b",
+    "base_url": "${OLLAMA_BASE_URL:-http://localhost:11434}",
+    "temperature": 0.0,
+    "max_tokens": 1024,
+    "timeout_seconds": 120,
+    "max_retries": 2
+  },
+
   "scraping": {
     "sources": [
       {
