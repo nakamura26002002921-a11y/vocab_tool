@@ -61,11 +61,23 @@ words.txt
 1. **機械翻訳（Google翻訳, deep-translator経由）** でロシア語原文（Meanings_RU /
    Collocations_RU / Examples_RU）を日本語へ直訳する。事実関係はGoogle翻訳エンジンに
    委ね、LLMには翻訳させない。
-2. **ローカルLLM**（config.jsonの`llm`設定と同じモデル）には「機械翻訳結果を、
-   ロシア語原文を参考にしつつ自然な日本語表現に整形する」ことだけを許可する。
-   新しい情報を追加すること・項目を統合/削除することは禁止している
+2. **ローカルLLM**（config.jsonの`polish_llm`セクションで指定するモデル）には
+   「機械翻訳結果を、ロシア語原文を参考にしつつ自然な日本語表現に整形する」ことだけを
+   許可する。新しい情報を追加すること・項目を統合/削除することは禁止している
    （プロンプトで明示。整形結果の妥当性はモデルの指示追従に委ねており、
    自動検証は行っていない）。
+
+`summarize.py`（ロシア語→構造化データの抽出）と`formatter.py`（機械翻訳結果→自然な
+日本語への整形）ではモデルに求める得意分野が異なるため、LLM設定は別セクションに
+分けている。
+
+| セクション | 用途 | 想定モデル |
+|---|---|---|
+| `llm` | `summarize.py`: ロシア語の生データから意味・例文等を抽出 | ロシア語特化モデル（Vikhr-Nemo等） |
+| `polish_llm` | `formatter.py`: 機械翻訳された日本語を自然な表現に整形 | 日本語に強い中規模モデル（デフォルト: `qwen2.5:14b`） |
+
+`polish_llm` セクションが config.json に無い場合は `llm` セクションにフォールバックする
+（後方互換のため）。
 
 LLM整形が不要、またはOllamaサーバを起動していない場合は `--onlyMT` オプションで
 Google翻訳の結果のみを採用し、LLM整形ステップを完全にスキップできる（詳細は下記）。
@@ -79,7 +91,11 @@ pip install -r requirements.txt
 Ollamaを起動し、モデルをダウンロードしておいてください。
 
 ```bash
+# summarize.py用（ロシア語の抽出・構造化）
 ollama pull hf.co/bartowski/Vikhr-Nemo-12B-Instruct-R-21-09-24-GGUF:Q4_K_M
+
+# formatter.py用（日本語訳の自然な整形）
+ollama pull qwen2.5:14b
 ```
 
 > **なぜVikhr-Nemoか**: 当初 `IlyaGusev/saiga2_13b_gguf` を使用していたが、GGUF内の
@@ -125,9 +141,10 @@ python formatter.py --input words.txt --output vocab.csv --startidx 3 --endidx 1
 | キー | 説明 |
 |---|---|
 | `database.path` | SQLiteファイルパス（デフォルト: `dictionary.db`） |
-| `llm.model` | Ollamaモデル名（デフォルト: Vikhr-Nemo-12B-Instruct） |
+| `llm.model` | Ollamaモデル名（summarize.py用、デフォルト: Vikhr-Nemo-12B-Instruct） |
 | `llm.temperature` | 生成温度（ハルシネーション防止のため `0.0` 推奨） |
 | `llm.max_tokens` | 最大トークン数（JSON出力はCSVよりキー名の分長くなるため `1536` 推奨） |
+| `polish_llm.model` | Ollamaモデル名（formatter.py用、日本語整形専用。デフォルト: `qwen2.5:14b`） |
 | `scraping.sources` | 辞書・翻訳サイトソースのリスト。複数サイトを自由に追加可能 |
 | `pipeline.max_workers` | 並列実行数 |
 | `pipeline.on_error` | `keep_as_error_row`（エラーもCSVに残す）または `exclude`（除外） |
@@ -236,8 +253,8 @@ LLM出力はJSONとしてパースした後、`Word`列は常に入力単語で�
   キャッシュ。`source_hash` は summaries テーブルの `_RU` 列（意味・コロケーション・
   例文）から算出するため、ロシア語原文が変わらない限り再翻訳・再整形しません。
   Google翻訳結果（`meanings_mt` 等）とLLM整形後もしくは最終採用値（`meanings_ja` 等）
-  を両方保存しており、`polish_model` 列を見ればその行がLLM整形されたか
-  （`--onlyMT` で生成され空欄のままか）を後から確認できます。
+  を両方保存しており、`polish_model` 列（例: `qwen2.5:14b`）を見ればその行がLLM整形
+  されたか（`--onlyMT` で生成され空欄のままか）を後から確認できます。
 
 ## エラーハンドリング
 
