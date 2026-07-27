@@ -22,21 +22,33 @@ CSV_HEADER = [
 
 # --- LLM用プロンプト ---
 SYSTEM_PROMPT = (
-    "You are a meticulous Japanese editor. Polish the raw machine-translated Japanese text "
-    "into natural dictionary-style Japanese. Do not add information. "
+    "You are a meticulous Japanese editor working on a Russian-Japanese dictionary. "
+    "You will be given a Russian original text and its raw machine translation into Japanese. "
+    "The Russian examples are hand-picked natural sentences, so they are reliable, "
+    "but the machine translation may misinterpret polysemous words, idioms, or context, "
+    "producing Japanese that does not match the intended meaning. "
+    "Your job is to polish the Japanese into natural dictionary-style text "
+    "while checking it against the Russian original. "
+    "If the machine translation's meaning conflicts with the Russian original, "
+    "correct the meaning based on the Russian original, not the machine translation. "
+    "Do not add information beyond what the Russian original conveys. "
     "Keep the exact number of ' / '-separated items. Output valid JSON only."
 )
 
 USER_PROMPT_TEMPLATE = """\
 # Task
 Polish the machine-translated Japanese for the Russian word "{word}".
+The Russian text below is a natural, human-authored original. The machine translation
+may contain mistranslations, especially for idioms or polysemous words. Where the
+machine translation's meaning conflicts with the Russian original, prioritize the
+Russian original's meaning over the machine translation.
 
-# Russian original
+# Russian original (authoritative source of meaning)
 Meanings_RU: {meanings_ru}
 Collocations_RU: {collocations_ru}
 Examples_RU: {examples_ru}
 
-# Raw machine translation
+# Raw machine translation (may contain mistranslations; use only as a draft for phrasing)
 Meanings_JA: {meanings_ja_mt}
 Collocations_JA: {collocations_ja_mt}
 Examples_JA: {examples_ja_mt}
@@ -44,7 +56,6 @@ Examples_JA: {examples_ja_mt}
 # Output JSON format
 {{"Meanings_JA": "...", "Collocations_JA": "...", "Examples_JA": "..."}}
 """
-
 
 # ---------------------------------------------------------------------------
 # DB読み込み
