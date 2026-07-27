@@ -95,7 +95,7 @@ Ollamaを起動し、モデルをダウンロードしておいてください�
 ollama pull hf.co/bartowski/Vikhr-Nemo-12B-Instruct-R-21-09-24-GGUF:Q4_K_M
 
 # formatter.py用（日本語訳の自然な整形）
-ollama pull qwen2.5:14b
+ollama pull qwen3:14b
 ```
 
 > **なぜVikhr-Nemoか**: 当初 `IlyaGusev/saiga2_13b_gguf` を使用していたが、GGUF内の
@@ -144,7 +144,7 @@ python formatter.py --input words.txt --output vocab.csv --startidx 3 --endidx 1
 | `llm.model` | Ollamaモデル名（summarize.py用、デフォルト: Vikhr-Nemo-12B-Instruct） |
 | `llm.temperature` | 生成温度（ハルシネーション防止のため `0.0` 推奨） |
 | `llm.max_tokens` | 最大トークン数（JSON出力はCSVよりキー名の分長くなるため `1536` 推奨） |
-| `polish_llm.model` | Ollamaモデル名（formatter.py用、日本語整形専用。デフォルト: `qwen2.5:14b`） |
+| `polish_llm.model` | Ollamaモデル名（formatter.py用、日本語整形専用。デフォルト: `qwen3:14b`） |
 | `scraping.sources` | 辞書・翻訳サイトソースのリスト。複数サイトを自由に追加可能 |
 | `pipeline.max_workers` | 並列実行数 |
 | `pipeline.on_error` | `keep_as_error_row`（エラーもCSVに残す）または `exclude`（除外） |
@@ -253,7 +253,7 @@ LLM出力はJSONとしてパースした後、`Word`列は常に入力単語で�
   キャッシュ。`source_hash` は summaries テーブルの `_RU` 列（意味・コロケーション・
   例文）から算出するため、ロシア語原文が変わらない限り再翻訳・再整形しません。
   Google翻訳結果（`meanings_mt` 等）とLLM整形後もしくは最終採用値（`meanings_ja` 等）
-  を両方保存しており、`polish_model` 列（例: `qwen2.5:14b`）を見ればその行がLLM整形
+  を両方保存しており、`polish_model` 列（例: `qwen3:14b`）を見ればその行がLLM整形
   されたか（`--onlyMT` で生成され空欄のままか）を後から確認できます。
 
 ## エラーハンドリング
