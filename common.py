@@ -44,6 +44,9 @@ def load_config(path: str = CONFIG_PATH) -> dict:
     if "llm" in config and "base_url" in config["llm"]:
         config["llm"]["base_url"] = _resolve_env_placeholder(config["llm"]["base_url"]).rstrip("/")
 
+    if "polish_llm" in config and "base_url" in config["polish_llm"]:
+        config["polish_llm"]["base_url"] = _resolve_env_placeholder(config["polish_llm"]["base_url"]).rstrip("/")
+
     # デフォルト値の補完
     config.setdefault("database", {}).setdefault("path", "dictionary.db")
     llm = config.setdefault("llm", {})
