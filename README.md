@@ -24,7 +24,8 @@ words.txt
                  → SQLite summaries テーブルにキャッシュ (キー: word, prompt_hash)
    │
    ▼
-[formatter.py]  vocab.csv として出力 (UTF-8 with BOM)
+[formatter.py]  DBの要約結果(ロシア語)にGoogle翻訳→(オプションで)LLM整形で
+                 日本語訳を付与し、vocab.csv として出力 (UTF-8 with BOM)
    │
    ▲
 [main.py]       ThreadPoolExecutor で単語ごとに並列実行、config.json 読込、
@@ -50,6 +51,24 @@ words.txt
 ただし **「ソースにない事実を作らない」というハルシネーション禁止の原則は変えない**。
 ノイズの除去・整形（フォーマットの正規化）は許容するが、情報の捏造・翻訳の追加などは
 禁止、という線引きをプロンプトで明示している。
+
+## 設計方針: 日本語訳のハルシネーション対策（formatter.py）
+
+ロシア語に強いローカルLLM（Vikhr-Nemo等）に直接「ロシア語→日本語」の翻訳をさせると、
+語彙力の薄い言語方向のため事実と異なる訳語をハルシネーションしやすい。
+そのため `formatter.py` では2段階方式を取る。
+
+1. **機械翻訳（Google翻訳, deep-translator経由）** でロシア語原文（Meanings_RU /
+   Collocations_RU / Examples_RU）を日本語へ直訳する。事実関係はGoogle翻訳エンジンに
+   委ね、LLMには翻訳させない。
+2. **ローカルLLM**（config.jsonの`llm`設定と同じモデル）には「機械翻訳結果を、
+   ロシア語原文を参考にしつつ自然な日本語表現に整形する」ことだけを許可する。
+   新しい情報を追加すること・項目を統合/削除することは禁止している
+   （プロンプトで明示。整形結果の妥当性はモデルの指示追従に委ねており、
+   自動検証は行っていない）。
+
+LLM整形が不要、またはOllamaサーバを起動していない場合は `--onlyMT` オプションで
+Google翻訳の結果のみを採用し、LLM整形ステップを完全にスキップできる（詳細は下記）。
 
 ## セットアップ
 
@@ -84,6 +103,22 @@ python main.py --input words.txt --output vocab.csv
 ```bash
 python main.py --input words.txt --output vocab.csv --startidx 3 --endidx 10
 ```
+
+### formatter.py 単体実行時のオプション
+
+CSV出力（日本語訳の付与）だけをやり直したい場合は `formatter.py` を単体で実行できます。
+
+```bash
+python formatter.py --input words.txt --output vocab.csv --startidx 3 --endidx 10
+```
+
+| オプション | 説明 |
+|---|---|
+| `--no-translate` | 日本語訳を付けず、ロシア語原文のみでCSVを出力する（動作確認・高速テスト用） |
+| `--onlyMT` | 日本語訳はGoogle翻訳の結果のみを採用し、LLMによる整形ステップを完全にスキップする（Ollamaサーバを起動していない場合や、LLM整形の要否を検証したい場合に使用） |
+
+`--no-translate` と `--onlyMT` は同時に指定した場合 `--no-translate` が優先されます
+（そもそも翻訳自体を行わないため）。
 
 ## config.json の主な設定項目
 
@@ -159,11 +194,15 @@ python main.py --input words.txt --output vocab.csv --startidx 3 --endidx 10
 | Aspect | 体（動詞のみ） | 英語（メタデータ） |
 | PairedVerb | ペア動詞 | ロシア語 |
 | Meanings_RU | 意味 | ロシア語原文 |
+| Meanings_JA | 意味 | 日本語訳（Google翻訳 + 任意でLLM整形） |
 | Collocations_RU | コロケーション | ロシア語原文 |
+| Collocations_JA | コロケーション | 日本語訳 |
 | Examples_RU | 例文 | ロシア語原文 |
+| Examples_JA | 例文 | 日本語訳 |
 | Accent | アクセント情報 | ロシア語（記号付き） |
 
-日本語訳は含まれません（言語混在によるノイズ防止のため）。
+`_JA` 列は `formatter.py` が summaries テーブルの `_RU` 列から生成する。
+`--no-translate` を指定した場合、`_JA` 列はすべて空欄になる。
 
 ## LLM呼び出しの仕組み
 
@@ -180,6 +219,11 @@ LLM出力はJSONとしてパースした後、`Word`列は常に入力単語で�
 配列で返ってきた場合は `" / "` 区切りの文字列に変換するなど、軽い後処理を行っている
 （`parse_json_object` 関数）。
 
+`formatter.py` のLLM整形呼び出し（Google翻訳結果の日本語を自然な表現に整える処理）も
+同じくOllamaネイティブの `/api/chat` を `format` パラメータ付きで呼び出す。
+呼び出しに失敗した場合はリトライした後、最終的にGoogle翻訳の結果をそのまま採用する
+（フォールバック）。
+
 ## キャッシュ戦略
 
 - **Scraping**: `(word, source_url)` キーでキャッシュ。`status='ok'` または
@@ -188,6 +232,12 @@ LLM出力はJSONとしてパースした後、`Word`列は常に入力単語で�
 - **Summarize**: `(word, prompt_hash)` キーでキャッシュ。`prompt_hash` は
   プロンプトテンプレート＋スクレイピング結果＋モデル名から算出されるため、
   プロンプトやスクレイピング結果、使用モデルが変わると自動的に再生成されます。
+- **formatter（日本語訳）**: `(word, source_hash)` キーで `translations_ja` テーブルに
+  キャッシュ。`source_hash` は summaries テーブルの `_RU` 列（意味・コロケーション・
+  例文）から算出するため、ロシア語原文が変わらない限り再翻訳・再整形しません。
+  Google翻訳結果（`meanings_mt` 等）とLLM整形後もしくは最終採用値（`meanings_ja` 等）
+  を両方保存しており、`polish_model` 列を見ればその行がLLM整形されたか
+  （`--onlyMT` で生成され空欄のままか）を後から確認できます。
 
 ## エラーハンドリング
 
@@ -196,6 +246,13 @@ LLM出力はJSONとしてパースした後、`Word`列は常に入力単語で�
 `pipeline.on_error` が `keep_as_error_row`（デフォルト）の場合、
 失敗した単語は `POS` 列に `ERROR: ...` と記載された行としてCSVに残ります。
 
+`formatter.py` 単体実行時のみ、上記とは挙動が異なる点に注意してください。
+summaries テーブルに該当単語のレコードが見つからない場合、その単語は
+（エラー行を残さず）標準出力にログを出して静かにスキップされ、最終CSVには
+含まれません。翻訳（Google翻訳 / LLM整形）に失敗した場合は `logs/errors.log`
+に記録した上で、その単語の `_JA` 列を空欄のままCSVに出力します
+（単語自体はスキップしません）。
+
 ## ファイル構成
 
 | ファイル | 役割 |
@@ -203,7 +260,7 @@ LLM出力はJSONとしてパースした後、`Word`列は常に入力単語で�
 | `common.py` | 設定読込・DB接続・ロギングの共通ユーティリティ |
 | `scraping.py` | wikitext方式/HTML方式のスクレイピング + raw_dataキャッシュ |
 | `summarize.py` | Ollama(Vikhr-Nemo-12B-Instruct)呼び出し + summariesキャッシュ |
-| `formatter.py` | vocab.csv 出力 |
+| `formatter.py` | Google翻訳+LLM整形で日本語訳を付与し vocab.csv 出力 |
 | `main.py` | 統合・並列実行エントリポイント |
 | `init_db.sql` | SQLiteテーブル定義 |
 | `config.json` | 設定ファイル |
