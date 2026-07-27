@@ -20,7 +20,7 @@ import csv
 import os
 from typing import Iterable
 
-from common import ensure_db_initialized, load_config
+from common import ensure_db_initialized, get_connection, load_config
 
 CSV_HEADER = [
     "Word",           # 見出し語（キリル文字）
@@ -52,6 +52,35 @@ def write_csv(rows: Iterable[dict], output_path: str, use_bom: bool = True) -> N
             writer.writerow(safe_row)
 
 
+def load_summary_from_db(db_path: str, word: str) -> dict | None:
+    """summaries テーブルから、指定した単語の最新レコード（created_at が最大のもの）を取得する。
+    同じ単語で prompt_hash が異なる（=再要約された）レコードが複数存在する場合があるため、
+    最新のものだけを採用する。見つからなければ None を返す。"""
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM summaries
+            WHERE word = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (word,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "Word": row["word"],
+        "POS": row["pos"] or "",
+        "Gender": row["gender"] or "",
+        "Aspect": row["aspect"] or "",
+        "PairedVerb": row["paired_verb"] or "",
+        "Meanings_RU": row["meanings_ru"] or "",
+        "Collocations_RU": row["collocations_ru"] or "",
+        "Examples_RU": row["examples_ru"] or "",
+        "Accent": row["accent"] or "",
+    }
+
+
 def make_error_row(word: str, message: str) -> dict:
     """エラー発生時のCSV行を作る。メタデータ以外の項目は空欄のまま、
     POS列に "ERROR: ..." を記録して原因を追跡できるようにする。"""
@@ -62,16 +91,23 @@ def make_error_row(word: str, message: str) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="単語リストをスクレイピングするツール")
+    parser = argparse.ArgumentParser(
+        description="scraping.py / summarize.py が保存したDBの内容をCSVに整形して出力するツール"
+    )
     parser.add_argument("--startidx", type=int, default=1, help="開始行 (1始まり)")
     parser.add_argument("--endidx", type=int, default=100, help="終了行")
     parser.add_argument("--input", type=str, default="words.txt", help="入力ファイル名")
+    parser.add_argument("--output", type=str, default=None, help="出力CSVファイル名（省略時は config.json の設定値）")
 
     args = parser.parse_args()
 
     # 設定とDBの初期化
     cfg = load_config()
-    ensure_db_initialized(cfg["database"]["path"])
+    db_path = cfg["database"]["path"]
+    ensure_db_initialized(db_path)
+
+    output_path = args.output or cfg["pipeline"]["output_file"]
+    use_bom = cfg["pipeline"]["csv_bom"]
 
     # ファイルの読み込み
     try:
@@ -85,10 +121,23 @@ def main():
     start = max(0, args.startidx - 1)
     end = min(len(lines), args.endidx)
 
-    # 処理実行
+    # DBから該当単語の要約結果を取り出してCSV行を組み立てる
+    rows = []
+    found_count = 0
     for i in range(start, end):
         word = lines[i]
         print(f"[{i + 1}/{len(lines)}] 処理中: {word}")
+
+        summary = load_summary_from_db(db_path, word)
+        if summary is None:
+            rows.append(make_error_row(word, "DBに要約結果が見つかりません（未処理またはsummarize失敗の可能性）"))
+        else:
+            rows.append(summary)
+            found_count += 1
+
+    # CSVとして書き出し
+    write_csv(rows, output_path, use_bom=use_bom)
+    print(f"完了: {len(rows)}件中{found_count}件をDBから取得し、'{output_path}' に書き出しました。")
 
 
 if __name__ == "__main__":
